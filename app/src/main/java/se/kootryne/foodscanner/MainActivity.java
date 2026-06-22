@@ -21,6 +21,8 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 
 import androidx.activity.ComponentActivity;
+import androidx.activity.result.ActivityResultLauncher;
+import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.annotation.NonNull;
 import androidx.camera.core.CameraSelector;
 import androidx.camera.core.ExperimentalGetImage;
@@ -36,6 +38,11 @@ import com.google.mlkit.vision.barcode.BarcodeScanning;
 import com.google.mlkit.vision.barcode.BarcodeScannerOptions;
 import com.google.mlkit.vision.barcode.common.Barcode;
 import com.google.mlkit.vision.common.InputImage;
+import com.google.mlkit.vision.text.TextRecognition;
+import com.google.mlkit.vision.text.TextRecognizer;
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions;
+
+import org.json.JSONException;
 
 import java.io.InputStream;
 import java.net.HttpURLConnection;
@@ -48,14 +55,22 @@ import java.util.concurrent.Executors;
 public class MainActivity extends ComponentActivity {
     private static final int CAMERA_PERMISSION_REQUEST = 42;
 
+    private enum ScanMode {
+        LOOKUP,
+        ADD_PRODUCT
+    }
+
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final Executor mainExecutor = command -> mainHandler.post(command);
 
     private ExecutorService cameraExecutor;
     private ExecutorService networkExecutor;
     private BarcodeScanner barcodeScanner;
+    private TextRecognizer textRecognizer;
     private ProcessCameraProvider cameraProvider;
     private ProductRepository productRepository;
+    private LocalProductStore localProductStore;
+    private ActivityResultLauncher<Void> ingredientPhotoLauncher;
 
     private PreviewView previewView;
     private TextView statusText;
@@ -66,6 +81,9 @@ public class MainActivity extends ComponentActivity {
     private ImageView productImage;
 
     private volatile boolean scanLocked = false;
+    private ScanMode scanMode = ScanMode.LOOKUP;
+    private String pendingAddGtin;
+    private String pendingAddName;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -74,6 +92,7 @@ public class MainActivity extends ComponentActivity {
         cameraExecutor = Executors.newSingleThreadExecutor();
         networkExecutor = Executors.newFixedThreadPool(3);
         productRepository = new ProductRepository();
+        localProductStore = new LocalProductStore(this);
 
         BarcodeScannerOptions options = new BarcodeScannerOptions.Builder()
                 .setBarcodeFormats(
@@ -83,11 +102,22 @@ public class MainActivity extends ComponentActivity {
                         Barcode.FORMAT_UPC_E)
                 .build();
         barcodeScanner = BarcodeScanning.getClient(options);
+        textRecognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS);
+
+        ingredientPhotoLauncher = registerForActivityResult(
+                new ActivityResultContracts.TakePicturePreview(),
+                bitmap -> {
+                    if (bitmap == null) {
+                        showStatus("Ingen bild togs. Testa igen.");
+                        return;
+                    }
+                    runIngredientOcr(bitmap);
+                });
 
         buildUi();
 
         if (hasCameraPermission()) {
-            startCamera();
+            startLookupCamera();
         } else {
             requestPermissions(new String[]{Manifest.permission.CAMERA}, CAMERA_PERMISSION_REQUEST);
         }
@@ -107,7 +137,7 @@ public class MainActivity extends ComponentActivity {
         title.setGravity(Gravity.CENTER_HORIZONTAL);
         root.addView(title);
 
-        TextView subtitle = makeField("Skanna en streckkod för att se produkt, bild och ingredienser.", 15, false);
+        TextView subtitle = makeField("Skanna en streckkod, eller lägg till egna ingredienser med OCR.", 15, false);
         subtitle.setTextColor(0xFF555555);
         subtitle.setGravity(Gravity.CENTER_HORIZONTAL);
         subtitle.setPadding(0, dp(6), 0, dp(14));
@@ -135,7 +165,7 @@ public class MainActivity extends ComponentActivity {
 
         Button scanButton = new Button(this);
         scanButton.setText("Skanna igen");
-        scanButton.setOnClickListener(v -> startCamera());
+        scanButton.setOnClickListener(v -> startLookupCamera());
         buttonRow.addView(scanButton, new LinearLayout.LayoutParams(0,
                 LinearLayout.LayoutParams.WRAP_CONTENT, 1));
 
@@ -146,6 +176,15 @@ public class MainActivity extends ComponentActivity {
                 LinearLayout.LayoutParams.WRAP_CONTENT, 1);
         manualParams.setMargins(dp(8), 0, 0, 0);
         buttonRow.addView(manualButton, manualParams);
+
+        Button addButton = new Button(this);
+        addButton.setText("Lägg till produkt");
+        addButton.setOnClickListener(v -> startAddProductFlow());
+        LinearLayout.LayoutParams addParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        addParams.setMargins(0, dp(8), 0, 0);
+        root.addView(addButton, addParams);
 
         productImage = new ImageView(this);
         productImage.setBackgroundColor(0xFFE0E0E0);
@@ -202,12 +241,114 @@ public class MainActivity extends ComponentActivity {
                     String gtin = sanitizeGtin(input.getText().toString());
                     if (isValidGtinLength(gtin)) {
                         if (cameraProvider != null) cameraProvider.unbindAll();
+                        scanMode = ScanMode.LOOKUP;
                         lookupProduct(gtin);
                     } else {
                         showStatus("GTIN måste vara 8, 12, 13 eller 14 siffror.");
                     }
                 })
                 .show();
+    }
+
+    private void startAddProductFlow() {
+        pendingAddGtin = null;
+        pendingAddName = null;
+        scanMode = ScanMode.ADD_PRODUCT;
+        startCamera("Skanna streckkoden på produkten du vill lägga till.");
+    }
+
+    private void showAddProductNameDialog(String gtin) {
+        pendingAddGtin = gtin;
+
+        EditText input = new EditText(this);
+        input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_WORDS);
+        input.setHint("Ex: Tonfisk i vatten");
+        input.setSingleLine(true);
+
+        new AlertDialog.Builder(this)
+                .setTitle("Produktnamn")
+                .setMessage("GTIN: " + gtin)
+                .setView(input)
+                .setNegativeButton("Avbryt", (dialog, which) -> {
+                    scanMode = ScanMode.LOOKUP;
+                    showStatus("Avbrutet.");
+                })
+                .setPositiveButton("Ta bild", (dialog, which) -> {
+                    String name = input.getText().toString().trim();
+                    if (name.isEmpty()) {
+                        name = "Egen produkt";
+                    }
+                    pendingAddName = name;
+                    takeIngredientPhoto();
+                })
+                .show();
+    }
+
+    private void takeIngredientPhoto() {
+        showStatus("Ta en tydlig, nära bild på ingredienslistan.");
+        ingredientPhotoLauncher.launch(null);
+    }
+
+    private void runIngredientOcr(Bitmap bitmap) {
+        showStatus("Läser ingredienslistan med OCR...");
+        InputImage image = InputImage.fromBitmap(bitmap, 0);
+        textRecognizer.process(image)
+                .addOnSuccessListener(result -> {
+                    String extracted = extractIngredientsFromOcr(result.getText());
+                    showIngredientsReviewDialog(extracted);
+                })
+                .addOnFailureListener(error -> {
+                    showStatus("OCR misslyckades: " + error.getMessage());
+                    showIngredientsReviewDialog("");
+                });
+    }
+
+    private void showIngredientsReviewDialog(String extractedIngredients) {
+        EditText input = new EditText(this);
+        input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
+        input.setMinLines(5);
+        input.setMaxLines(10);
+        input.setGravity(Gravity.TOP | Gravity.START);
+        input.setText(extractedIngredients == null ? "" : extractedIngredients.trim());
+        input.setHint("Korrigera OCR-texten här innan du sparar.");
+
+        new AlertDialog.Builder(this)
+                .setTitle("Kontrollera ingredienser")
+                .setMessage("OCR kan läsa fel. Kolla igenom texten innan du sparar.")
+                .setView(input)
+                .setNegativeButton("Avbryt", (dialog, which) -> {
+                    scanMode = ScanMode.LOOKUP;
+                    showStatus("Avbrutet.");
+                })
+                .setPositiveButton("Spara", (dialog, which) -> {
+                    String ingredients = input.getText().toString().trim();
+                    saveLocalProduct(ingredients);
+                })
+                .show();
+    }
+
+    private void saveLocalProduct(String ingredients) {
+        if (!isValidGtinLength(pendingAddGtin)) {
+            showStatus("Kunde inte spara: GTIN saknas.");
+            return;
+        }
+
+        Product product = new Product(
+                emptyTo(pendingAddName, "Egen produkt"),
+                pendingAddGtin,
+                ingredients,
+                "",
+                "Egen produkt (OCR)"
+        );
+
+        try {
+            localProductStore.saveProduct(product);
+            scanMode = ScanMode.LOOKUP;
+            showProduct(product, pendingAddGtin);
+            showStatus("Sparad lokalt. Nästa gång visas dina egna ingredienser.");
+        } catch (JSONException error) {
+            showStatus("Kunde inte spara produkten: " + error.getMessage());
+        }
     }
 
     private boolean hasCameraPermission() {
@@ -218,16 +359,21 @@ public class MainActivity extends ComponentActivity {
     public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions, @NonNull int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         if (requestCode == CAMERA_PERMISSION_REQUEST && grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-            startCamera();
+            startLookupCamera();
         } else {
-            showStatus("Kameratillstånd behövs för att skanna streckkoder.");
+            showStatus("Kameratillstånd behövs för att skanna streckkoder och ta OCR-bilder.");
         }
     }
 
-    private void startCamera() {
+    private void startLookupCamera() {
+        scanMode = ScanMode.LOOKUP;
+        startCamera("Rikta kameran mot streckkoden.");
+    }
+
+    private void startCamera(String statusMessage) {
         scanLocked = false;
         productImage.setImageDrawable(null);
-        showStatus("Rikta kameran mot streckkoden.");
+        showStatus(statusMessage);
 
         ListenableFuture<ProcessCameraProvider> cameraProviderFuture = ProcessCameraProvider.getInstance(this);
         cameraProviderFuture.addListener(() -> {
@@ -289,11 +435,22 @@ public class MainActivity extends ComponentActivity {
         scanLocked = true;
         mainHandler.post(() -> {
             if (cameraProvider != null) cameraProvider.unbindAll();
-            lookupProduct(gtin);
+            if (scanMode == ScanMode.ADD_PRODUCT) {
+                showAddProductNameDialog(gtin);
+            } else {
+                lookupProduct(gtin);
+            }
         });
     }
 
     private void lookupProduct(String gtin) {
+        Product localProduct = localProductStore.getProduct(gtin);
+        if (localProduct != null) {
+            showProduct(localProduct, gtin);
+            showStatus("Hittad i dina egna sparade produkter.");
+            return;
+        }
+
         showStatus("Söker efter " + gtin + "...");
         productNameText.setText("Söker produkt...");
         gtinText.setText("GTIN: " + gtin);
@@ -316,8 +473,8 @@ public class MainActivity extends ComponentActivity {
             productNameText.setText("Ingen produkt hittades");
             gtinText.setText("GTIN: " + gtin);
             sourceText.setText("Källa: ingen träff");
-            ingredientsText.setText("Jag hittade ingen produktdata för den här streckkoden.");
-            showStatus("Ingen träff. Testa en annan vara eller skriv GTIN manuellt.");
+            ingredientsText.setText("Jag hittade ingen produktdata för den här streckkoden. Tryck på Lägg till produkt för att spara den själv.");
+            showStatus("Ingen träff. Du kan lägga till produkten själv med OCR.");
             return;
         }
 
@@ -326,14 +483,19 @@ public class MainActivity extends ComponentActivity {
         sourceText.setText("Källa: " + emptyTo(product.source, "okänd"));
         ingredientsText.setText(emptyTo(product.ingredients, "Inga ingredienser angivna i datakällan."));
 
-        if (product.source != null && product.source.toLowerCase(Locale.ROOT).contains("open food facts")) {
-            showStatus("Hittad via fallback. Lägg in GS1_PRODUCT_ENDPOINT som GitHub secret för riktig GS1-data.");
+        String source = product.source == null ? "" : product.source.toLowerCase(Locale.ROOT);
+        if (source.contains("egen produkt")) {
+            showStatus("Hittad i dina egna sparade produkter.");
+        } else if (source.contains("open food facts")) {
+            showStatus("Hittad via fallback. Du kan lägga till egna ingredienser med OCR om något saknas.");
         } else {
             showStatus("Produkt hittad.");
         }
 
         if (product.imageUrl != null && !product.imageUrl.trim().isEmpty()) {
             loadImage(product.imageUrl);
+        } else {
+            productImage.setImageDrawable(null);
         }
     }
 
@@ -381,6 +543,67 @@ public class MainActivity extends ComponentActivity {
         return length == 8 || length == 12 || length == 13 || length == 14;
     }
 
+    private static String extractIngredientsFromOcr(String text) {
+        if (text == null) return "";
+
+        String cleaned = text
+                .replace('\n', ' ')
+                .replace('\r', ' ')
+                .replaceAll("\\s+", " ")
+                .trim();
+
+        if (cleaned.isEmpty()) {
+            return "";
+        }
+
+        String lower = cleaned.toLowerCase(Locale.ROOT);
+        int start = findFirstIndex(lower, "ingredienser", "ingredients", "innehåll");
+        if (start < 0) {
+            return cleaned;
+        }
+
+        String after = cleaned.substring(start);
+        after = after.replaceFirst("(?i)^(ingredienser|ingredients|innehåll)[:： ]*", "").trim();
+        String afterLower = after.toLowerCase(Locale.ROOT);
+
+        int end = after.length();
+        String[] stopWords = {
+                "näringsvärde",
+                "näringsinformation",
+                "nutrition",
+                "allergener",
+                "allergy",
+                "förvaring",
+                "förvaras",
+                "bäst före",
+                "netto",
+                "ursprung",
+                "tillverkad",
+                "producent",
+                "distributör"
+        };
+
+        for (String stopWord : stopWords) {
+            int stopIndex = afterLower.indexOf(stopWord);
+            if (stopIndex > 0 && stopIndex < end) {
+                end = stopIndex;
+            }
+        }
+
+        return after.substring(0, end).trim();
+    }
+
+    private static int findFirstIndex(String text, String... needles) {
+        int best = -1;
+        for (String needle : needles) {
+            int index = text.indexOf(needle);
+            if (index >= 0 && (best < 0 || index < best)) {
+                best = index;
+            }
+        }
+        return best;
+    }
+
     private static String emptyTo(String value, String fallback) {
         return value == null || value.trim().isEmpty() ? fallback : value.trim();
     }
@@ -390,6 +613,7 @@ public class MainActivity extends ComponentActivity {
         super.onDestroy();
         if (cameraProvider != null) cameraProvider.unbindAll();
         if (barcodeScanner != null) barcodeScanner.close();
+        if (textRecognizer != null) textRecognizer.close();
         if (cameraExecutor != null) cameraExecutor.shutdownNow();
         if (networkExecutor != null) networkExecutor.shutdownNow();
     }
