@@ -35,9 +35,7 @@ final class ProductRepository {
         String name = findString(json, 0,
                 "productName", "tradeItemDescription", "regulatedProductName",
                 "functionalName", "description", "name", "title");
-        String ingredients = findString(json, 0,
-                "ingredientStatement", "ingredientStatementDescription", "ingredients",
-                "ingredientsText", "ingredients_text", "ingredientList", "composition");
+        String ingredients = findIngredientString(json);
         String imageUrl = findString(json, 0,
                 "imageUrl", "productImageUrl", "image_front_url", "image_url", "image", "uri");
         String foundGtin = findString(json, 0, "gtin", "gtin13", "gtin14", "code");
@@ -52,7 +50,7 @@ final class ProductRepository {
     private Product lookupOpenFoodFacts(String gtin) throws IOException, JSONException {
         String encoded = URLEncoder.encode(gtin, "UTF-8");
         String url = "https://world.openfoodfacts.org/api/v2/product/" + encoded
-                + ".json?fields=code,product_name,brands,ingredients_text,image_front_url,image_url";
+                + ".json?fields=code,product_name,brands,ingredients_text,ingredients_text_sv,ingredients_text_en,ingredients,ingredients_hierarchy,ingredients_tags,image_front_url,image_url";
         JSONObject json = new JSONObject(httpGet(url, ""));
         if (json.optInt("status", 0) != 1) {
             return null;
@@ -69,7 +67,15 @@ final class ProductRepository {
             name = brand + " – " + name;
         }
 
-        String ingredients = product.optString("ingredients_text", "").trim();
+        String ingredients = firstNonEmpty(
+                product.optString("ingredients_text_sv", ""),
+                product.optString("ingredients_text", ""),
+                product.optString("ingredients_text_en", ""),
+                ingredientsFromArray(product.optJSONArray("ingredients")),
+                tagsToReadableText(product.optJSONArray("ingredients_tags")),
+                tagsToReadableText(product.optJSONArray("ingredients_hierarchy"))
+        );
+
         String imageUrl = product.optString("image_front_url", "").trim();
         if (imageUrl.isEmpty()) {
             imageUrl = product.optString("image_url", "").trim();
@@ -128,6 +134,172 @@ final class ProductRepository {
         }
     }
 
+    private static String findIngredientString(Object value) throws JSONException {
+        return findStringInsideMatchedKeys(
+                value,
+                0,
+                new String[]{
+                        "ingredientStatement",
+                        "ingredientStatementDescription",
+                        "ingredients",
+                        "ingredientsText",
+                        "ingredients_text",
+                        "ingredients_text_sv",
+                        "ingredients_text_en",
+                        "ingredientList",
+                        "ingredientInformation",
+                        "composition"
+                },
+                new String[]{
+                        "value",
+                        "text",
+                        "content",
+                        "description",
+                        "languageSpecificValue",
+                        "languageSpecificStringValue",
+                        "languageSpecificText",
+                        "formattedText"
+                }
+        );
+    }
+
+    private static String findStringInsideMatchedKeys(Object value, int depth, String[] matchedKeys, String[] valueKeys) throws JSONException {
+        if (value == null || depth > 6) {
+            return null;
+        }
+
+        if (value instanceof JSONObject) {
+            JSONObject object = (JSONObject) value;
+            for (String key : matchedKeys) {
+                if (object.has(key) && !object.isNull(key)) {
+                    Object matchedValue = object.get(key);
+                    String direct = stringifyJsonValue(matchedValue);
+                    if (!isBlank(direct)) {
+                        return direct.trim();
+                    }
+                    String nested = findString(matchedValue, 0, valueKeys);
+                    if (!isBlank(nested)) {
+                        return nested.trim();
+                    }
+                    String flattened = flattenTextValues(matchedValue, 0);
+                    if (!isBlank(flattened)) {
+                        return flattened.trim();
+                    }
+                }
+            }
+
+            Iterator<String> iterator = object.keys();
+            while (iterator.hasNext()) {
+                String found = findStringInsideMatchedKeys(object.opt(iterator.next()), depth + 1, matchedKeys, valueKeys);
+                if (!isBlank(found)) {
+                    return found.trim();
+                }
+            }
+        } else if (value instanceof JSONArray) {
+            JSONArray array = (JSONArray) value;
+            for (int i = 0; i < array.length(); i++) {
+                String found = findStringInsideMatchedKeys(array.opt(i), depth + 1, matchedKeys, valueKeys);
+                if (!isBlank(found)) {
+                    return found.trim();
+                }
+            }
+        }
+        return null;
+    }
+
+    private static String ingredientsFromArray(JSONArray ingredients) {
+        if (ingredients == null) {
+            return "";
+        }
+
+        StringBuilder builder = new StringBuilder();
+        for (int i = 0; i < ingredients.length(); i++) {
+            Object item = ingredients.opt(i);
+            String text = null;
+            if (item instanceof JSONObject) {
+                JSONObject object = (JSONObject) item;
+                text = firstNonEmpty(
+                        object.optString("text", ""),
+                        object.optString("id", ""),
+                        object.optString("name", "")
+                );
+            } else if (item instanceof String) {
+                text = String.valueOf(item);
+            }
+
+            text = cleanIngredientToken(text);
+            if (!isBlank(text)) {
+                if (builder.length() > 0) builder.append(", ");
+                builder.append(text);
+            }
+        }
+        return builder.toString();
+    }
+
+    private static String tagsToReadableText(JSONArray tags) {
+        if (tags == null) {
+            return "";
+        }
+        StringBuilder builder = new StringBuilder();
+        for (int i = 0; i < tags.length(); i++) {
+            String text = cleanIngredientToken(tags.optString(i, ""));
+            if (!isBlank(text)) {
+                if (builder.length() > 0) builder.append(", ");
+                builder.append(text);
+            }
+        }
+        return builder.toString();
+    }
+
+    private static String cleanIngredientToken(String value) {
+        if (value == null) {
+            return "";
+        }
+        String cleaned = value.trim();
+        int colon = cleaned.indexOf(':');
+        if (colon >= 0 && colon < cleaned.length() - 1) {
+            cleaned = cleaned.substring(colon + 1);
+        }
+        return cleaned.replace('-', ' ').trim();
+    }
+
+    private static String flattenTextValues(Object value, int depth) throws JSONException {
+        if (value == null || depth > 4) {
+            return "";
+        }
+        if (value instanceof String || value instanceof Number || value instanceof Boolean) {
+            return String.valueOf(value).trim();
+        }
+        if (value instanceof JSONArray) {
+            JSONArray array = (JSONArray) value;
+            StringBuilder builder = new StringBuilder();
+            for (int i = 0; i < array.length(); i++) {
+                String item = flattenTextValues(array.opt(i), depth + 1);
+                if (!isBlank(item)) {
+                    if (builder.length() > 0) builder.append(", ");
+                    builder.append(item.trim());
+                }
+            }
+            return builder.toString();
+        }
+        if (value instanceof JSONObject) {
+            JSONObject object = (JSONObject) value;
+            String direct = firstNonEmpty(
+                    object.optString("value", ""),
+                    object.optString("text", ""),
+                    object.optString("content", ""),
+                    object.optString("description", ""),
+                    object.optString("languageSpecificValue", ""),
+                    object.optString("languageSpecificStringValue", ""),
+                    object.optString("formattedText", "")
+            );
+            if (!isBlank(direct)) {
+                return direct.trim();
+            }
+        }
+        return "";
+    }
+
     private static String findString(Object value, int depth, String... keys) throws JSONException {
         if (value == null || depth > 5) {
             return null;
@@ -137,7 +309,7 @@ final class ProductRepository {
             for (String key : keys) {
                 if (object.has(key) && !object.isNull(key)) {
                     String direct = stringifyJsonValue(object.get(key));
-                    if (direct != null && !direct.trim().isEmpty()) {
+                    if (!isBlank(direct)) {
                         return direct.trim();
                     }
                 }
@@ -145,7 +317,7 @@ final class ProductRepository {
             Iterator<String> iterator = object.keys();
             while (iterator.hasNext()) {
                 String found = findString(object.opt(iterator.next()), depth + 1, keys);
-                if (found != null && !found.trim().isEmpty()) {
+                if (!isBlank(found)) {
                     return found.trim();
                 }
             }
@@ -153,7 +325,7 @@ final class ProductRepository {
             JSONArray array = (JSONArray) value;
             for (int i = 0; i < array.length(); i++) {
                 String found = findString(array.opt(i), depth + 1, keys);
-                if (found != null && !found.trim().isEmpty()) {
+                if (!isBlank(found)) {
                     return found.trim();
                 }
             }
@@ -173,7 +345,7 @@ final class ProductRepository {
             StringBuilder builder = new StringBuilder();
             for (int i = 0; i < array.length(); i++) {
                 String item = stringifyJsonValue(array.opt(i));
-                if (item != null && !item.trim().isEmpty()) {
+                if (!isBlank(item)) {
                     if (builder.length() > 0) builder.append(", ");
                     builder.append(item.trim());
                 }
@@ -181,6 +353,19 @@ final class ProductRepository {
             return builder.length() == 0 ? null : builder.toString();
         }
         return null;
+    }
+
+    private static String firstNonEmpty(String... values) {
+        for (String value : values) {
+            if (!isBlank(value)) {
+                return value.trim();
+            }
+        }
+        return "";
+    }
+
+    private static boolean isBlank(String value) {
+        return value == null || value.trim().isEmpty();
     }
 
     private static String emptyTo(String value, String fallback) {
