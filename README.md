@@ -7,7 +7,24 @@ Android-app för Samsung Galaxy S10/Android som skannar EAN/UPC-streckkoder och 
 - Skannar streckkoder med kameran via CameraX + ML Kit.
 - Slår upp GTIN/EAN-koden.
 - Visar produktnamn, GTIN, bild och ingredienser.
+- Låter dig lägga till en egen produkt genom att skanna streckkoden, skriva produktnamn och ta en bild på ingredienslistan.
+- Kör OCR på ingrediensbilden och låter dig granska/korrigera texten innan produkten sparas lokalt på mobilen.
 - Är byggd för APK via GitHub Actions.
+
+## Lägg till egen produkt med OCR
+
+Tryck på `Lägg till produkt` i appen.
+
+Flödet är:
+
+1. Skanna produktens streckkod.
+2. Skriv produktnamnet.
+3. Ta en tydlig, nära bild på ingredienslistan.
+4. Appen kör OCR med ML Kit Text Recognition.
+5. Kontrollera och korrigera texten.
+6. Spara produkten lokalt.
+
+Nästa gång samma GTIN skannas visas den sparade produkten först, innan appen testar externa datakällor.
 
 ## Viktigt om GS1 Sweden ProductSearch
 
@@ -17,6 +34,7 @@ Därför är appen byggd så här:
 
 1. Den försöker först använda en konfigurerad GS1-endpoint/proxy.
 2. Om ingen GS1-endpoint är konfigurerad faller den tillbaka till Open Food Facts så att APK:n ändå är testbar direkt.
+3. Om du har sparat en egen produkt lokalt med OCR används den först.
 
 För riktig GS1-data: skapa GitHub Actions secrets:
 
