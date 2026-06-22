@@ -1,0 +1,60 @@
+plugins {
+    id 'com.android.application'
+}
+
+def escapeBuildConfigString = { value ->
+    return value.replace('\\', '\\\\').replace('"', '\\"')
+}
+
+def gs1Endpoint = providers.gradleProperty('GS1_PRODUCT_ENDPOINT')
+        .orElse(providers.environmentVariable('GS1_PRODUCT_ENDPOINT'))
+        .orElse('')
+        .get()
+
+def gs1ApiKey = providers.gradleProperty('GS1_API_KEY')
+        .orElse(providers.environmentVariable('GS1_API_KEY'))
+        .orElse('')
+        .get()
+
+android {
+    namespace 'se.kootryne.foodscanner'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'se.kootryne.foodscanner'
+        minSdk 26
+        targetSdk 35
+        versionCode 1
+        versionName '0.1.0'
+    }
+
+    buildFeatures {
+        buildConfig true
+    }
+
+    buildTypes {
+        debug {
+            buildConfigField 'String', 'GS1_PRODUCT_ENDPOINT', '"' + escapeBuildConfigString(gs1Endpoint) + '"'
+            buildConfigField 'String', 'GS1_API_KEY', '"' + escapeBuildConfigString(gs1ApiKey) + '"'
+        }
+        release {
+            minifyEnabled false
+            buildConfigField 'String', 'GS1_PRODUCT_ENDPOINT', '"' + escapeBuildConfigString(gs1Endpoint) + '"'
+            buildConfigField 'String', 'GS1_API_KEY', '"' + escapeBuildConfigString(gs1ApiKey) + '"'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    implementation 'androidx.activity:activity:1.9.3'
+    implementation 'androidx.camera:camera-core:1.4.1'
+    implementation 'androidx.camera:camera-camera2:1.4.1'
+    implementation 'androidx.camera:camera-lifecycle:1.4.1'
+    implementation 'androidx.camera:camera-view:1.4.1'
+    implementation 'com.google.mlkit:barcode-scanning:17.3.0'
+}
